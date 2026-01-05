@@ -5,6 +5,7 @@
 <div align="center">
 
 [![Docs](https://img.shields.io/badge/Docs-Read%20Now-blue?style=for-the-badge&logo=googledocs)](https://wowoengine.github.io/SawitDB/)
+[![Packagist](https://img.shields.io/packagist/v/wowoengine/sawitdb-php?style=for-the-badge&logo=packagist)](https://packagist.org/packages/wowoengine/sawitdb-php)
 [![Node.js Version](https://img.shields.io/badge/Node.js%20Version-Visit%20Repo-green?style=for-the-badge&logo=nodedotjs)](https://github.com/WowoEngine/SawitDB)
 [![Go Version](https://img.shields.io/badge/Go%20Version-Visit%20Repo-cyan?style=for-the-badge&logo=go)](https://github.com/WowoEngine/SawitDB-Go)
 
@@ -14,7 +15,7 @@
 
 The system features a custom **Paged Heap File** architecture similar to SQLite, using fixed-size 4KB pages to ensure efficient memory usage. What differentiates SawitDB is its unique **Agricultural Query Language (AQL)**, which replaces standard SQL keywords with Indonesian farming terminology.
 
-**Now in PHP!** Connect via TCP using the `sawitdb://` protocol, similar to MongoDB.
+**Now availability on Packagist!**
 
 **🚨 Emergency: Aceh Flood Relief**
 Please support our brothers and sisters in Aceh.
