@@ -1,0 +1,37 @@
+{
+    "name": "wowoengine/sawitdb-php",
+    "description": "PHP Port of SawitDB Node.JS Version",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "database",
+        "sawitdb",
+        "php",
+        "wowoengine",
+        "flatfile"
+    ],
+    "authors": [
+        {
+            "name": "SawitDB Community"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "SawitDB\\": "src/"
+        }
+    },
+    "require": {
+        "php": "^8.0",
+        "illuminate/support": "^8.0|^9.0|^10.0|^11.0"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "SawitDB\\Laravel\\SawitDBServiceProvider"
+            ],
+            "aliases": {
+                "SawitDB": "SawitDB\\Laravel\\Facades\\SawitDB"
+            }
+        }
+    }
+}
