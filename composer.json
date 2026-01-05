@@ -1,6 +1,6 @@
 {
     "name": "wowoengine/sawitdb-php",
-    "description": "PHP Port of SawitDB Node.JS Version",
+    "description": "PHP Port of SawitDB Node.JS Version - A single-file NoSQL database for PHP.",
     "type": "library",
     "license": "MIT",
     "keywords": [
@@ -8,22 +8,33 @@
         "sawitdb",
         "php",
         "wowoengine",
-        "flatfile"
+        "flatfile",
+        "nosql",
+        "embedded"
     ],
     "authors": [
         {
             "name": "SawitDB Community"
         }
     ],
+    "require": {
+        "php": "^8.0",
+        "ext-json": "*"
+    },
+    "suggest": {
+        "illuminate/support": "Required for Laravel integration (^8.0|^9.0|^10.0|^11.0)"
+    },
+    "require-dev": {
+        "illuminate/support": "^8.0|^9.0|^10.0|^11.0",
+        "phpunit/phpunit": "^9.0"
+    },
     "autoload": {
         "psr-4": {
             "SawitDB\\": "src/"
         }
     },
-    "require": {
-        "php": "^8.0",
-        "illuminate/support": "^8.0|^9.0|^10.0|^11.0"
-    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
     "extra": {
         "laravel": {
             "providers": [
@@ -33,5 +44,9 @@
                 "SawitDB": "SawitDB\\Laravel\\Facades\\SawitDB"
             }
         }
+    },
+    "config": {
+        "sort-packages": true,
+        "optimize-autoloader": true
     }
 }

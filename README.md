@@ -43,22 +43,31 @@ SawitDB is built with the spirit of "Data Sovereignty". We believe a reliable da
 
 ## Installation
 
-Ensure you have PHP 8.0+ installed.
+Install via Composer:
 
 ```bash
-git clone https://github.com/WowoEngine/SawitDB-PHP.git
-cd SawitDB-PHP
-composer install
+composer require wowoengine/sawitdb-php
 ```
 
-## Laravel Integration
+## Framework Support
+
+### Vanilla PHP & CodeIgniter 4
+SawitDB acts as a standard PSR-4 library. You can use the `WowoEngine` directly or connect via the Client.
+
+```php
+use SawitDB\Engine\WowoEngine;
+$db = new WowoEngine(__DIR__ . '/plantation.sawit');
+```
+
+### Laravel Integration
 
 SawitDB includes a ServiceProvider and Facade for seamless Laravel integration.
 
 1.  **Install via Composer**: `composer require wowoengine/sawitdb-php`
-2.  **Configuration**: Add the configuration to `config/database.php` (Optional, defaults to `database_path('sawit.db')`).
+2.  **Configuration**: Publish the config or add to `config/database.php`.
 
 ```php
+// config/database.php
 'connections' => [
     'sawit' => [
         'database' => env('SAWIT_DB_DATABASE', database_path('plantation.sawit')),

@@ -1,2 +1,15 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Release Exclusions
+/.github export-ignore
+/.gitattributes export-ignore
+/.gitignore export-ignore
+/tests export-ignore
+/verify.php export-ignore
+/verify_laravel.php export-ignore
+/benchmark.php export-ignore
+/tests_security.php export-ignore
+/test_data.db export-ignore
+/composer.lock export-ignore
+/phpunit.xml export-ignore
