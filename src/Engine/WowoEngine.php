@@ -7,21 +7,109 @@ use Exception;
 class WowoEngine
 {
     private $pager;
-    private $indexes = [];
+    private $indexes = []; // 'table.field' -> BTreeIndex instance
     private $parser;
+    private $wal;
+    
+    // Query Cache
+    private $queryCache = [];
+    private $queryCacheLimit = 1000;
 
     public function __construct(string $filePath)
     {
         $this->pager = new Pager($filePath);
         $this->parser = new QueryParser();
+        $this->wal = new WAL($filePath);
+        
+        // Persistence: Initialize System Tables
+        $this->initSystem();
+    }
+    
+    public function close()
+    {
+        if ($this->wal) $this->wal->close();
+        if ($this->pager) $this->pager->close();
+    }
+
+    private function initSystem()
+    {
+        // Check if _indexes table exists
+        $entry = $this->findTableEntry('_indexes');
+        if (!$entry) {
+            try {
+                $this->createTable('_indexes');
+            } catch (Exception $e) {
+                // Ignore concurrency or existence issues
+            }
+        }
+        
+        // Load Indexes
+        $this->loadIndexes();
+    }
+
+    private function loadIndexes()
+    {
+        if (!$this->findTableEntry('_indexes')) return;
+
+        // Select all from _indexes
+        // We can't use public select() easily because it might recurse or rely on state not ready?
+        // But select() uses scanTable which is low level. Should be fine.
+        $rows = $this->select('_indexes', null, null, null, null);
+        
+        foreach ($rows as $rec) {
+            $table = $rec['table'] ?? null;
+            $field = $rec['field'] ?? null;
+            if (!$table || !$field) continue;
+
+            $indexKey = "$table.$field";
+            if (!isset($this->indexes[$indexKey])) {
+                $index = new BTreeIndex();
+                $index->name = $indexKey;
+                $index->keyField = $field;
+
+                // Populate Index
+                try {
+                    $entry = $this->findTableEntry($table);
+                    if ($entry) {
+                        $allRecords = $this->scanTable($entry, null);
+                        foreach ($allRecords as $record) {
+                            if (isset($record[$field])) {
+                                $index->insert($record[$field], $record);
+                            }
+                        }
+                        $this->indexes[$indexKey] = $index;
+                    }
+                } catch (Exception $e) {
+                    // Log?
+                }
+            }
+        }
     }
 
     public function query(string $query, array $params = [])
     {
-        $cmd = $this->parser->parse($query, $params);
-
+        // Query Cache (Simple LRU)
+        $cacheKey = $query;
+        $cmd = null;
+        if (isset($this->queryCache[$cacheKey])) {
+            $cmd = $this->queryCache[$cacheKey]; // Copy array
+        } else {
+            // Parse without params to get template
+            $cmd = $this->parser->parse($query, []);
+            if ($cmd['type'] !== 'ERROR') {
+                $this->queryCache[$cacheKey] = $cmd;
+                if (count($this->queryCache) > $this->queryCacheLimit) {
+                    array_shift($this->queryCache);
+                }
+            }
+        }
+        
         if ($cmd['type'] === 'EMPTY') return "";
         if ($cmd['type'] === 'ERROR') return "Error: " . $cmd['message'];
+
+        if (!empty($params)) {
+             $cmd = $this->parser->parse($query, $params);
+        }
 
         try {
             switch ($cmd['type']) {
@@ -30,17 +118,20 @@ class WowoEngine
                 case 'SHOW_TABLES':
                     return $this->showTables();
                 case 'SHOW_INDEXES':
-                    return $this->showIndexes($cmd['table']);
+                    return $this->showIndexes($cmd['table'] ?? null);
                 case 'INSERT':
                     return $this->insert($cmd['table'], $cmd['data']);
                 case 'SELECT':
-                     $rows = $this->select($cmd['table'], $cmd['criteria'], $cmd['sort'], $cmd['limit'], $cmd['offset']);
-                     // Strip system fields for public output
+                     // Handle Joins
+                     $joins = $cmd['joins'] ?? [];
+                     $rows = $this->select($cmd['table'], $cmd['criteria'], $cmd['sort'], $cmd['limit'], $cmd['offset'], $joins);
+                     
+                     // Strip system fields
                      $cleanRows = array_map(function($r) {
                          unset($r['_rid']);
                          return $r;
                      }, $rows);
-
+                     
                      if (count($cmd['cols']) === 1 && $cmd['cols'][0] === '*') return $cleanRows;
                      
                      return array_map(function($r) use ($cmd) {
@@ -49,7 +140,7 @@ class WowoEngine
                              $newRow[$c] = $r[$c] ?? null;
                          }
                          return $newRow;
-                     }, $rows);
+                     }, $cleanRows);
                 case 'DELETE':
                     return $this->delete($cmd['table'], $cmd['criteria']);
                 case 'UPDATE':
@@ -71,12 +162,13 @@ class WowoEngine
     private function findTableEntry($name)
     {
         $p0 = $this->pager->readPage(0);
+        $p0 = $this->pager->readPage(0);
         $numTables = unpack('V', substr($p0, 8, 4))[1];
         $offset = 12;
 
         for ($i = 0; $i < $numTables; $i++) {
             $tName = trim(substr($p0, $offset, 32));
-            $tName = str_replace("\0", "", $tName); // Unpack trimming might miss binary nulls
+            $tName = str_replace("\0", "", $tName);
 
             if ($tName === $name) {
                 return [
@@ -95,7 +187,6 @@ class WowoEngine
     {
         if (!$name) throw new Exception("Nama kebun tidak boleh kosong");
         if (strlen($name) > 32) throw new Exception("Nama kebun max 32 karakter");
-        // Strict Alphanumeric check to prevent weird table names
         if (!preg_match('/^[a-zA-Z0-9_]+$/', $name)) throw new Exception("Nama kebun hanya boleh huruf, angka, dan underscore.");
 
         if ($this->findTableEntry($name)) return "Kebun '$name' sudah ada.";
@@ -108,202 +199,148 @@ class WowoEngine
 
         $newPageId = $this->pager->allocPage();
 
-        // Write Name (32 bytes)
+        // RELOAD Page 0 because allocPage modified it (totalPages incremented)
+        $p0 = $this->pager->readPage(0);
+
         $p0 = substr_replace($p0, str_pad($name, 32, "\0"), $offset, 32);
-        
-        // Write StartPage & LastPage
         $p0 = substr_replace($p0, pack('V', $newPageId), $offset + 32, 4);
         $p0 = substr_replace($p0, pack('V', $newPageId), $offset + 36, 4);
-
-        // Update NumTables
         $p0 = substr_replace($p0, pack('V', $numTables + 1), 8, 4);
 
         $this->pager->writePage(0, $p0);
+        
+        $this->wal->logOperation('CREATE_TABLE', $name, $newPageId, null, null);
         return "Kebun '$name' telah dibuka.";
     }
 
-    public function showTables()
-    {
-        $p0 = $this->pager->readPage(0);
-        $numTables = unpack('V', substr($p0, 8, 4))[1];
-        $tables = [];
-        $offset = 12;
-
-        for ($i = 0; $i < $numTables; $i++) {
-            $tName = trim(substr($p0, $offset, 32));
-            $tName = str_replace("\0", "", $tName);
-            $tables[] = $tName;
-            $offset += 40;
-        }
-        return $tables;
-    }
-
-    public function dropTable($name)
-    {
-        $entry = $this->findTableEntry($name);
-        if (!$entry) return "Kebun '$name' tidak ditemukan.";
-
-        $p0 = $this->pager->readPage(0);
-        $numTables = unpack('V', substr($p0, 8, 4))[1];
-
-        // Fill gap if not last
-        if ($numTables > 1 && $entry['index'] < $numTables - 1) {
-            $lastOffset = 12 + (($numTables - 1) * 40);
-            $lastEntry = substr($p0, $lastOffset, 40);
-            $p0 = substr_replace($p0, $lastEntry, $entry['offset'], 40);
-        }
-
-        // Clear last
-        $lastOffset = 12 + (($numTables - 1) * 40);
-        $p0 = substr_replace($p0, str_repeat("\0", 40), $lastOffset, 40);
-
-        // Update count
-        $p0 = substr_replace($p0, pack('V', $numTables - 1), 8, 4);
-        $this->pager->writePage(0, $p0);
-
-        return "Kebun '$name' telah dibakar (Drop).";
-    }
-
-    private function updateTableLastPage($name, $newLastPageId)
-    {
-        $entry = $this->findTableEntry($name);
-        if (!$entry) throw new Exception("Entry missing");
-        
-        $p0 = $this->pager->readPage(0);
-        $p0 = substr_replace($p0, pack('V', $newLastPageId), $entry['offset'] + 36, 4);
-        $this->pager->writePage(0, $p0);
-    }
-
-    public function insert($table, $data)
-    {
-        if (empty($data)) throw new Exception("Data kosong");
-        
-        $entry = $this->findTableEntry($table);
-        if (!$entry) throw new Exception("Kebun '$table' tidak ditemukan.");
-
-        $json = json_encode($data);
-        $dataBuf = $json;
-        $recordLen = strlen($dataBuf);
-        $totalLen = 2 + $recordLen; // 2 byte len prefix
-
-        $currentPageId = $entry['lastPage'];
-        $pData = $this->pager->readPage($currentPageId);
-        $freeOffset = unpack('v', substr($pData, 6, 2))[1];
-
-        if ($freeOffset + $totalLen > Pager::PAGE_SIZE) {
-            $newPageId = $this->pager->allocPage();
-            
-            // Link OLD page to NEW page (Next Page ID at offset 0)
-            $pData = substr_replace($pData, pack('V', $newPageId), 0, 4);
-            $this->pager->writePage($currentPageId, $pData);
-
-            $currentPageId = $newPageId;
-            $pData = $this->pager->readPage($currentPageId);
-            $freeOffset = unpack('v', substr($pData, 6, 2))[1];
-            
-            $this->updateTableLastPage($table, $currentPageId);
-        }
-
-        // Write Record Len
-        $pData = substr_replace($pData, pack('v', $recordLen), $freeOffset, 2);
-        // Write Data
-        $pData = substr_replace($pData, $dataBuf, $freeOffset + 2, $recordLen);
-
-        // Update Count
-        $count = unpack('v', substr($pData, 4, 2))[1];
-        $pData = substr_replace($pData, pack('v', $count + 1), 4, 2);
-        
-        // Update Free Offset
-        $pData = substr_replace($pData, pack('v', $freeOffset + $totalLen), 6, 2);
-
-        $this->pager->writePage($currentPageId, $pData);
-
-        // Inject _rid (PageID:OffsetOfData)
-        // Offset of data is $freeOffset + 2 (len prefix is 2 bytes)
-        // Wait, $freeOffset was the start of the block.
-        // Block: [Len:2][Data:N]
-        // We want to identify the record. Let's use Block Start Offset ($freeOffset) for simplicity in calc,
-        // but data starts at +2. Let's use Block Start.
-        $data['_rid'] = "$currentPageId:$freeOffset";
-
-        // Update Indexes
-        $this->updateIndexes($table, $data);
-
-        return "Bibit tertanam.";
-    }
-
-    private function checkMatch($obj, $criteria)
-    {
-        if (!$criteria) return true;
-
-        if (isset($criteria['type']) && $criteria['type'] === 'compound') {
-             $result = true;
-             // Logic handling simplifying... assuming AND mostly or generic check
-             // Doing simplified sequential check logic
-             
-             foreach ($criteria['conditions'] as $i => $cond) {
-                 $match = $this->checkSingleCondition($obj, $cond);
-                 if ($i === 0) {
-                     $result = $match;
-                 } else {
-                     if ($cond['logic'] === 'OR') {
-                         $result = $result || $match;
-                     } else {
-                         $result = $result && $match;
-                     }
-                 }
-             }
-             return $result;
-        }
-
-        return $this->checkSingleCondition($obj, $criteria);
-    }
-
-    private function checkSingleCondition($obj, $criteria)
-    {
-        $key = $criteria['key'];
-        if (!array_key_exists($key, $obj)) return false; // Or strict?
-        
-        $val = $obj[$key];
-        $target = $criteria['val'];
-
-        switch ($criteria['op']) {
-            case '=': return $val == $target;
-            case '!=': return $val != $target;
-            case '>': return $val > $target;
-            case '<': return $val < $target;
-            case '>=': return $val >= $target;
-            case '<=': return $val <= $target;
-            case 'IN': return in_array($val, $target);
-            case 'NOT IN': return !in_array($val, $target);
-            case 'LIKE':
-                $pattern = '/^' . str_replace('%', '.*', $target) . '$/i';
-                return preg_match($pattern, (string)$val);
-            case 'BETWEEN':
-                return $val >= $target[0] && $val <= $target[1];
-            case 'IS NULL': return is_null($val);
-            case 'IS NOT NULL': return !is_null($val);
-            default: return false;
-        }
-    }
-
-    private function select($table, $criteria, $sort, $limit, $offsetCount)
+    private function select($table, $criteria = null, $sort = null, $limit = null, $offsetCount = null, $joins = [])
     {
         $entry = $this->findTableEntry($table);
         if (!$entry) throw new Exception("Kebun '$table' tidak ditemukan.");
 
         $results = [];
 
-        // Index Opt
-        if ($criteria && !isset($criteria['type']) && $criteria['op'] === '=' && !$sort) {
-            $indexKey = "$table." . $criteria['key'];
-            if (isset($this->indexes[$indexKey])) {
-                $results = $this->indexes[$indexKey]->search($criteria['val']);
+        if (!empty($joins)) {
+            // JOIN Logic
+            $mainRows = $this->scanTable($entry, null);
+            $currentRows = [];
+            foreach ($mainRows as $row) {
+                $newRow = $row; // Keep original for reference?
+                foreach ($row as $k => $v) {
+                    $newRow["$table.$k"] = $v;
+                }
+                $currentRows[] = $newRow;
+            }
+
+            foreach ($joins as $join) {
+                $joinTable = $join['table'];
+                $joinEntry = $this->findTableEntry($joinTable);
+                if (!$joinEntry) throw new Exception("Kebun '$joinTable' tidak ditemukan.");
+
+                $on = $join['on']; // { left, op, right }
+                $nextRows = [];
+
+                // Optimization: Hash Join if op is '='
+                $useHashJoin = ($on['op'] === '=');
+                //$useHashJoin = false; // DEBUG: Force Nested Loop to verify correctness first
+
+                if ($useHashJoin) {
+                    // Hash Phase
+                    $joinMap = [];
+                    $joinData = $this->scanTable($joinEntry, null);
+                    
+                    // Determine Right Key (strip prefix if exists)
+                    $rightKey = $on['right'];
+                    if (str_starts_with($rightKey, "$joinTable.")) {
+                        $rightKey = substr($rightKey, strlen($joinTable) + 1);
+                    }
+
+                    foreach ($joinData as $row) {
+                        $val = $row[$rightKey] ?? null;
+                        if ($val === null) continue;
+                        
+                        $keyStr = (string)$val;
+                        if (!isset($joinMap[$keyStr])) $joinMap[$keyStr] = [];
+                        $joinMap[$keyStr][] = $row;
+                    }
+
+                    // Probe Phase
+                    foreach ($currentRows as $leftRow) {
+                        $leftVal = $leftRow[$on['left']] ?? null;
+                        if ($leftVal === null) continue;
+                        
+                        $keyStr = (string)$leftVal;
+                        if (isset($joinMap[$keyStr])) {
+                            foreach ($joinMap[$keyStr] as $rightRow) {
+                                // Merge
+                                $merged = $leftRow;
+                                foreach ($rightRow as $k => $v) {
+                                    $merged["$joinTable.$k"] = $v;
+                                }
+                                $nextRows[] = $merged;
+                            }
+                        }
+                    }
+
+                } else {
+                    // Nested Loop
+                    $joinData = $this->scanTable($joinEntry, null);
+                    foreach ($currentRows as $leftRow) {
+                        foreach ($joinData as $rightRow) {
+                            // Check Condition
+                            $lVal = $leftRow[$on['left']] ?? null;
+                            
+                            $rightKey = $on['right'];
+                             if (str_starts_with($rightKey, "$joinTable.")) {
+                                $rightKey = substr($rightKey, strlen($joinTable) + 1);
+                            }
+                            $rVal = $rightRow[$rightKey] ?? null;
+
+                            $match = false;
+                            
+                            switch ($on['op']) {
+                                case '=': $match = ($lVal == $rVal); break;
+                                case '!=': $match = ($lVal != $rVal); break;
+                                case '>': $match = ($lVal > $rVal); break;
+                                case '<': $match = ($lVal < $rVal); break;
+                                // ... others
+                            }
+
+                            if ($match) {
+                                $merged = $leftRow;
+                                foreach ($rightRow as $k => $v) {
+                                    $merged["$joinTable.$k"] = $v;
+                                }
+                                $nextRows[] = $merged;
+                            }
+                        }
+                    }
+                }
+                $currentRows = $nextRows;
+            }
+            
+            $results = $currentRows;
+            
+            // Apply Criteria on joined results
+            if ($criteria) {
+                $results = array_filter($results, function($bg) use ($criteria) {
+                    return $this->checkMatch($bg, $criteria);
+                });
+            }
+
+        } else {
+            // Normal Selection
+            if ($criteria && !isset($criteria['type']) && $criteria['op'] === '=' && !$sort) {
+                // Index optimization for simple equality
+                $indexKey = "$table." . $criteria['key'];
+                if (isset($this->indexes[$indexKey])) {
+                    $results = $this->indexes[$indexKey]->search($criteria['val']);
+                } else {
+                    $results = $this->scanTable($entry, $criteria);
+                }
             } else {
                 $results = $this->scanTable($entry, $criteria);
             }
-        } else {
-            $results = $this->scanTable($entry, $criteria);
         }
 
         // Sort
@@ -330,198 +367,93 @@ class WowoEngine
         $currentPageId = $entry['startPage'];
         $results = [];
 
-        while ($currentPageId !== 0) {
-            $pData = $this->pager->readPage($currentPageId);
-            $count = unpack('v', substr($pData, 4, 2))[1];
-            $offset = 8;
+        $hasSimpleCriteria = false;
+        $cKey = null; $cOp = null; $cVal = null;
+        
+        if ($criteria && !isset($criteria['type'])) {
+            $hasSimpleCriteria = true;
+            $cKey = $criteria['key'];
+            $cOp = $criteria['op'];
+            $cVal = $criteria['val'];
+        }
 
-            for ($i = 0; $i < $count; $i++) {
-                $len = unpack('v', substr($pData, $offset, 2))[1];
-                $jsonStr = substr($pData, $offset + 2, $len);
-                $obj = json_decode($jsonStr, true);
-                
-                if ($obj) {
-                    $obj['_rid'] = "$currentPageId:$offset"; // Inject RowID
-                    if ($this->checkMatch($obj, $criteria)) {
+        while ($currentPageId !== 0) {
+            $pageData = $this->pager->readPageObjects($currentPageId); // ['next'=>, 'items'=>]
+            
+            foreach ($pageData['items'] as $idx => $obj) {
+                if ($hasSimpleCriteria) {
+                    $val = $obj[$cKey] ?? null;
+                    $matches = false;
+                    switch ($cOp) {
+                        case '=': $matches = ($val == $cVal); break;
+                        case '>': $matches = ($val > $cVal); break;
+                        case '<': $matches = ($val < $cVal); break;
+                        default: $matches = $this->checkMatch($obj, $criteria);
+                    }
+                    if ($matches) {
+                        $obj['_rid'] = "$currentPageId:$idx"; 
                         $results[] = $obj;
                     }
+                } elseif (!$criteria || $this->checkMatch($obj, $criteria)) {
+                    $obj['_rid'] = "$currentPageId:$idx"; 
+                    $results[] = $obj;
                 }
-                $offset += 2 + $len;
             }
-            $currentPageId = unpack('V', substr($pData, 0, 4))[1];
+            
+            $currentPageId = $pageData['next'];
         }
         return $results;
     }
 
-    public function delete($table, $criteria)
+    private function checkMatch($obj, $criteria)
     {
-        // Optimization: If criteria contains _rid, we can target specific pages
-        $targetInfos = [];
-        if (isset($criteria['_rid'])) {
-             // Single deletion or IN array
-             $rids = is_array($criteria['_rid']) ? $criteria['_rid'] : [$criteria['_rid']];
-             foreach ($rids as $rid) {
-                 [$pid, $off] = explode(':', $rid);
-                 $targetInfos[$pid][] = (int)$off;
-             }
-        } elseif (isset($criteria['op']) && $criteria['op'] === 'IN' && $criteria['key'] === '_rid') {
-             // Handle IN operator for _rid
-             foreach ($criteria['val'] as $rid) {
-                 [$pid, $off] = explode(':', $rid);
-                 $targetInfos[$pid][] = (int)$off;
-             }
-        } else {
-             // Try to use Index via Select to find RIDs
-             try {
-                // Peek if select uses index
-                // Note: We blindly trust select to be faster than scan if indexed.
-                // Even scan-select to get RIDs might be slower than scan-delete directly due to double read?
-                // Actually scan-delete READS and CHECKS. Select READS and CHECKS.
-                // If Select uses Index, it's O(log N). Then Delete is O(1) per RID. Very fast.
-                // If Select uses Scan, it's O(N). Then Delete is O(1) per RID.
-                // Total O(N). Same as scan-delete.
-                // BUT scan-delete rewrites pages. Targeted delete rewrites ONLY affected pages.
-                // So resolving RIDs first is almost always better for scattered deletes.
+        if (!$criteria) return true;
+
+        if (isset($criteria['type']) && $criteria['type'] === 'compound') {
+            $result = ($criteria['logic'] !== 'OR');
+            
+            foreach ($criteria['conditions'] as $cond) {
+                $match = $this->checkMatch($obj, $cond);
                 
-                $candidates = $this->select($table, $criteria, null, null, null);
-                if (!empty($candidates)) {
-                    foreach ($candidates as $c) {
-                        if (isset($c['_rid'])) {
-                             [$pid, $off] = explode(':', $c['_rid']);
-                             $targetInfos[$pid][] = (int)$off;
-                        }
-                    }
-                }
-             } catch (Exception $e) {
-                 // Fallback to scan if select fails
-             }
-        }
-
-        if (!empty($targetInfos)) {
-            // Targeted Deletion (Fast Path)
-            $deletedCount = 0;
-            foreach ($targetInfos as $pid => $offsets) {
-                $pData = $this->pager->readPage($pid);
-                $count = unpack('v', substr($pData, 4, 2))[1];
-                $readOffset = 8;
-                $recordsToKeep = [];
-                $modified = false;
-
-                for ($i = 0; $i < $count; $i++) {
-                    $len = unpack('v', substr($pData, $readOffset, 2))[1];
-                    // Check if this record's offset is in our delete list
-                    if (in_array($readOffset, $offsets)) {
-                        $deletedCount++;
-                        $modified = true;
-                    } else {
-                        $recordsToKeep[] = ['len' => $len, 'data' => substr($pData, $readOffset + 2, $len)];
-                    }
-                    $readOffset += 2 + $len;
-                }
-
-                if ($modified) {
-                    $this->rewritePage($pid, $recordsToKeep);
-                }
-            }
-            return "Berhasil menggusur $deletedCount bibit (Optimized).";
-        }
-
-        // Fallback: Full Scan
-        $entry = $this->findTableEntry($table);
-        if (!$entry) throw new Exception("Kebun '$table' tidak ditemukan.");
-        $currentPageId = $entry['startPage'];
-        $deletedCount = 0;
-
-        while ($currentPageId !== 0) {
-            $pData = $this->pager->readPage($currentPageId);
-            $count = unpack('v', substr($pData, 4, 2))[1];
-            $readOffset = 8;
-            $recordsToKeep = [];
-            $modified = false;
-
-            for ($i = 0; $i < $count; $i++) {
-                $len = unpack('v', substr($pData, $readOffset, 2))[1];
-                $jsonStr = substr($pData, $readOffset + 2, $len);
-                $obj = json_decode($jsonStr, true);
-                
-                // Inject RID for matching if needed, though usually criteria doesn't check RID in scan
-                if ($obj) $obj['_rid'] = "$currentPageId:$readOffset";
-
-                if ($obj && $this->checkMatch($obj, $criteria)) {
-                    $deletedCount++;
-                    $modified = true;
+                if ($criteria['logic'] === 'OR') {
+                    $result = $result || $match;
+                    if ($result) return true;
                 } else {
-                    $recordsToKeep[] = ['len' => $len, 'data' => substr($pData, $readOffset + 2, $len)];
+                    $result = $result && $match;
+                    if (!$result) return false;
                 }
-                $readOffset += 2 + $len;
             }
-
-            if ($modified) {
-                $this->rewritePage($currentPageId, $recordsToKeep);
-            }
-            $currentPageId = unpack('V', substr($pData, 0, 4))[1];
+            return $result;
         }
-        return "Berhasil menggusur $deletedCount bibit.";
+
+        return $this->checkSingleCondition($obj, $criteria);
     }
 
-    private function rewritePage($pid, $recordsToKeep) {
-        $writeOffset = 8;
-        $pData = str_repeat("\0", Pager::PAGE_SIZE);
-        
-        // Restore NextPageID (we need to read it again or passed it? 
-        // WowoEngine logic was reading it from old pData. 
-        // Optimally we should just modify the buffer but keeping it clean:
-        $oldPage = $this->pager->readPage($pid);
-        $nextPageId = substr($oldPage, 0, 4);
-        
-        $pData = substr_replace($pData, $nextPageId, 0, 4);
-        $pData = substr_replace($pData, pack('v', count($recordsToKeep)), 4, 2);
-
-        foreach ($recordsToKeep as $rec) {
-            $pData = substr_replace($pData, pack('v', $rec['len']), $writeOffset, 2);
-            $pData = substr_replace($pData, $rec['data'], $writeOffset + 2, $rec['len']);
-            $writeOffset += 2 + $rec['len'];
-        }
-        
-        $pData = substr_replace($pData, pack('v', $writeOffset), 6, 2);
-        $this->pager->writePage($pid, $pData);
-    }
-
-    public function update($table, $updates, $criteria)
+    private function checkSingleCondition($obj, $criteria)
     {
-        // Optimized Update: Select (Get RIDs) -> Delete by RIDs -> Insert
-        $records = $this->select($table, $criteria, null, null, null);
-        if (empty($records)) return "Tidak ada bibit yang cocok untuk dipupuk.";
+        $key = $criteria['key'];
+        $val = $obj[$key] ?? null;
+        $target = $criteria['val'];
 
-        $ridsToDelete = [];
-        $newRecords = [];
-
-        foreach ($records as $rec) {
-            if (isset($rec['_rid'])) {
-                $ridsToDelete[] = $rec['_rid'];
-            }
-            // Apply updates
-            foreach ($updates as $k => $v) {
-                $rec[$k] = $v;
-            }
-            unset($rec['_rid']); // Don't insert the old RID
-            $newRecords[] = $rec;
+        switch ($criteria['op']) {
+            case '=': return $val == $target;
+            case '!=': return $val != $target;
+            case '>': return $val > $target;
+            case '<': return $val < $target;
+            case '>=': return $val >= $target;
+            case '<=': return $val <= $target;
+            case 'IN': return is_array($target) && in_array($val, $target);
+            case 'NOT IN': return is_array($target) && !in_array($val, $target);
+            case 'LIKE':
+                $pattern = '/^' . str_replace('%', '.*', $target) . '$/i';
+                return preg_match($pattern, (string)$val);
+            case 'BETWEEN':
+                return $val >= $target[0] && $val <= $target[1];
+            case 'IS NULL': return is_null($val);
+            case 'IS NOT NULL': return !is_null($val);
+            default: return false;
         }
-
-        if (!empty($ridsToDelete)) {
-            // Bulk delete by RID (Fast)
-            $this->delete($table, ['op' => 'IN', 'key' => '_rid', 'val' => $ridsToDelete]);
-        }
-
-        $count = 0;
-        foreach ($newRecords as $rec) {
-            $this->insert($table, $rec);
-            $count++;
-        }
-        return "Berhasil memupuk $count bibit.";
     }
-
-    // Index Methods
 
     public function createIndex($table, $field)
     {
@@ -535,46 +467,232 @@ class WowoEngine
         $index->name = $indexKey;
         $index->keyField = $field;
 
-        $all = $this->select($table, null, null, null, null);
+        $all = $this->scanTable($entry, null);
         foreach ($all as $rec) {
-            if (isset($rec[$field])) {
-                $index->insert($rec[$field], $rec);
-            }
+             if (isset($rec[$field])) {
+                 $index->insert($rec[$field], $rec);
+             }
         }
 
         $this->indexes[$indexKey] = $index;
+        $this->insert('_indexes', ['table' => $table, 'field' => $field]);
+
         return "Indeks dibuat pada '$indexKey'.";
     }
 
-    public function showIndexes($table)
+    public function delete($table, $criteria)
     {
-        // Simple list return
+        $entry = $this->findTableEntry($table);
+        if (!$entry) throw new Exception("Kebun '$table' tidak ditemukan.");
+        
+        $currentPageId = $entry['startPage'];
+        $deletedCount = 0;
+        
+        while ($currentPageId !== 0) {
+            $pData = $this->pager->readPage($currentPageId); // Raw buffer
+            $count = unpack('v', substr($pData, 4, 2))[1];
+            $readOffset = 8;
+            $recordsToKeep = [];
+            $modified = false;
+            
+            for ($i = 0; $i < $count; $i++) {
+                $len = unpack('v', substr($pData, $readOffset, 2))[1];
+                $jsonStr = substr($pData, $readOffset + 2, $len);
+                $obj = json_decode($jsonStr, true);
+                
+                if ($obj && $this->checkMatch($obj, $criteria)) {
+                    $deletedCount++;
+                    $modified = true;
+                    // WAL
+                    $this->wal->logOperation('DELETE', $table, $currentPageId, $jsonStr, null);
+
+                     if ($table !== '_indexes') {
+                         $this->updateIndexes($table, null, $obj);
+                     }
+                } else {
+                    $recordsToKeep[] = ['len' => $len, 'data' => substr($pData, $readOffset + 2, $len), 'obj' => $obj];
+                }
+                $readOffset += 2 + $len;
+            }
+            
+            if ($modified) {
+                $items = array_map(function($r) { return $r['obj']; }, $recordsToKeep);
+                $next = unpack('V', substr($pData, 0, 4))[1];
+                $this->pager->updatePageObjects($currentPageId, $next, $items);
+            }
+            
+            $currentPageId = unpack('V', substr($pData, 0, 4))[1];
+        }
+        
+        return "Berhasil menggusur $deletedCount bibit.";
+    }
+    
+    public function insert($table, $data) {
+        $entry = $this->findTableEntry($table);
+        if (!$entry) throw new Exception("Kebun '$table' tidak ditemukan.");
+        
+        $json = json_encode($data);
+        $dataBuf = $json;
+        $recordLen = strlen($dataBuf);
+        $totalLen = 2 + $recordLen;
+        
+        $currentPageId = $entry['lastPage'];
+        $pData = $this->pager->readPage($currentPageId); // Raw
+        $freeOffset = unpack('v', substr($pData, 6, 2))[1];
+        
+        if ($freeOffset + $totalLen > Pager::PAGE_SIZE) {
+            $newPageId = $this->pager->allocPage();
+            
+            $pData = substr_replace($pData, pack('V', $newPageId), 0, 4);
+            $this->pager->writePage($currentPageId, $pData);
+            
+            $currentPageId = $newPageId;
+            $pData = $this->pager->readPage($currentPageId);
+            $freeOffset = unpack('v', substr($pData, 6, 2))[1];
+            
+            $this->updateTableLastPage($table, $currentPageId);
+        }
+        
+        $pData = substr_replace($pData, pack('v', $recordLen), $freeOffset, 2);
+        $pData = substr_replace($pData, $dataBuf, $freeOffset + 2, $recordLen);
+        
+        $count = unpack('v', substr($pData, 4, 2))[1];
+        $pData = substr_replace($pData, pack('v', $count + 1), 4, 2);
+        $pData = substr_replace($pData, pack('v', $freeOffset + $totalLen), 6, 2);
+        
+        $this->pager->writePage($currentPageId, $pData);
+        
+        // WAL
+        $this->wal->logOperation('INSERT', $table, $currentPageId, null, $json);
+
+        if ($table !== '_indexes') {
+            // Add _rid for index usage
+            $data['_rid'] = "$currentPageId:$count";
+            $this->updateIndexes($table, $data, null);
+        }
+        
+        return "Bibit tertanam.";
+    }
+    
+    public function showTables()
+    {
+        $p0 = $this->pager->readPage(0);
+        $numTables = unpack('V', substr($p0, 8, 4))[1];
+        $tables = [];
+        $offset = 12;
+
+        for ($i = 0; $i < $numTables; $i++) {
+            $tName = trim(substr($p0, $offset, 32));
+            $tName = str_replace("\0", "", $tName);
+            if (!str_starts_with($tName, '_')) {
+                $tables[] = $tName;
+            }
+            $offset += 40;
+        }
+        return $tables;
+    }
+    
+    public function showIndexes($table) 
+    {
         $list = [];
         foreach ($this->indexes as $k => $v) {
-             if (!$table || str_starts_with($k, "$table.")) {
-                 $list[] = $k;
-             }
+            if (!$table || str_starts_with($k, "$table.")) {
+                $list[] = $k;
+            }
         }
         return empty($list) ? "Tidak ada indeks." : $list;
     }
-
-    private function updateIndexes($table, $data)
+    
+    private function updateTableLastPage($name, $newLastPageId)
     {
-        foreach ($this->indexes as $key => $index) {
-            list($tbl, $fld) = explode('.', $key);
-            if ($tbl === $table && isset($data[$fld])) {
-                $index->insert($data[$fld], $data);
-            }
-        }
+        $entry = $this->findTableEntry($name);
+        if (!$entry) throw new Exception("Entry missing");
+        
+        $p0 = $this->pager->readPage(0);
+        $p0 = substr_replace($p0, pack('V', $newLastPageId), $entry['offset'] + 36, 4);
+        $this->pager->writePage(0, $p0);
     }
 
-    // Aggregate
+    private function updateIndexes($table, $newObj, $oldObj)
+    {
+         foreach ($this->indexes as $key => $index) {
+            list($tbl, $fld) = explode('.', $key);
+            if ($tbl !== $table) continue;
+
+             if ($oldObj && isset($oldObj[$fld])) {
+                 if (!$newObj || $newObj[$fld] !== $oldObj[$fld]) {
+                     $index->delete($oldObj[$fld]);
+                 }
+             }
+
+             if ($newObj && isset($newObj[$fld])) {
+                  if (!$oldObj || $newObj[$fld] !== $oldObj[$fld]) {
+                      $index->insert($newObj[$fld], $newObj);
+                  }
+             }
+        }
+    }
+    
+    public function update($table, $updates, $criteria) {
+        $records = $this->select($table, $criteria, null, null, null);
+        if (empty($records)) return "Tidak ada bibit yang cocok.";
+        
+        $this->delete($table, $criteria);
+        
+        $count = 0;
+        foreach ($records as $rec) {
+             unset($rec['_rid']);
+             foreach ($updates as $k => $v) $rec[$k] = $v;
+             $this->insert($table, $rec);
+             $count++;
+        }
+        return "Berhasil memupuk $count bibit.";
+    }
+    
+    public function dropTable($name) {
+         if ($name === '_indexes') return "Tidak boleh membakar catatan sistem.";
+         $res = $this->_dropTableInternal($name);
+         
+         $toUnset = [];
+         foreach ($this->indexes as $k => $i) {
+             if (str_starts_with($k, "$name.")) $toUnset[] = $k;
+         }
+         foreach ($toUnset as $k) unset($this->indexes[$k]);
+         
+         $this->delete('_indexes', ['key' => 'table', 'op' => '=', 'val' => $name]);
+         
+         return $res;
+    }
+    
+    private function _dropTableInternal($name) {
+        $entry = $this->findTableEntry($name);
+        if (!$entry) return "Kebun '$name' tidak ditemukan.";
+
+        $p0 = $this->pager->readPage(0);
+        $numTables = unpack('V', substr($p0, 8, 4))[1];
+
+        if ($numTables > 1 && $entry['index'] < $numTables - 1) {
+            $lastOffset = 12 + (($numTables - 1) * 40);
+            $lastEntry = substr($p0, $lastOffset, 40);
+            $p0 = substr_replace($p0, $lastEntry, $entry['offset'], 40);
+        }
+
+        $lastOffset = 12 + (($numTables - 1) * 40);
+        $p0 = substr_replace($p0, str_repeat("\0", 40), $lastOffset, 40);
+        $p0 = substr_replace($p0, pack('V', $numTables - 1), 8, 4);
+        $this->pager->writePage(0, $p0);
+
+        // WAL
+        $this->wal->logOperation('DROP_TABLE', $name, 0, null, null);
+
+        return "Kebun '$name' telah dibakar (Drop).";
+    }
+
     public function aggregate($table, $func, $field, $criteria, $groupBy)
     {
         $records = $this->select($table, $criteria, null, null, null);
         
         if ($groupBy) {
-            // Grouped
             $groups = [];
             foreach ($records as $r) {
                 $k = $r[$groupBy] ?? 'NULL';
@@ -593,7 +711,7 @@ class WowoEngine
 
         return $this->calcAggregate($func, $field, $records);
     }
-
+    
     private function calcAggregate($func, $field, $records)
     {
         $func = strtoupper($func);

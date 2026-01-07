@@ -9,7 +9,8 @@ class QueryParser
     public function tokenize(string $sql): array
     {
         // Regex to match tokens
-        $tokenRegex = '/\s*(=>|!=|>=|<=|<>|[(),=*.<>?]|[a-zA-Z_]\w*|@\w+|\d+|\'[^\']*\'|"[^"]*")\s*/';
+        // Updated to handle escaped quotes in strings: 'It\'s me', floats, negatives
+        $tokenRegex = '/\s*(=>|!=|>=|<=|<>|[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)?|@\w+|-?\d+(?:\.\d+)?|\'(?:[^\'\\\\]|\\\\.)*\'|"(?:[^"\\\\]|\\\\.)*"|[(),=*.<>?])\s*/';
         preg_match_all($tokenRegex, $sql, $matches);
         return $matches[1] ?? [];
     }
@@ -192,6 +193,28 @@ class QueryParser
         $table = $tokens[$i];
         $i++;
 
+        // Parse Joins
+        $joins = [];
+        while ($i < count($tokens) && in_array(strtoupper($tokens[$i]), ['JOIN', 'GABUNG'])) {
+            $i++; // Skip JOIN
+            $joinTable = $tokens[$i];
+            $i++;
+
+            if ($i >= count($tokens) || !in_array(strtoupper($tokens[$i]), ['ON', 'PADA'])) {
+                throw new Exception("Syntax: JOIN [table] ON [condition]");
+            }
+            $i++; // Skip ON
+
+            $left = $tokens[$i];
+            $i++;
+            $op = $tokens[$i];
+            $i++;
+            $right = $tokens[$i];
+            $i++;
+
+            $joins[] = ['table' => $joinTable, 'on' => ['left' => $left, 'op' => $op, 'right' => $right]];
+        }
+
         $criteria = null;
         if ($i < count($tokens) && in_array(strtoupper($tokens[$i]), ['DIMANA', 'WHERE'])) {
             $i++;
@@ -231,26 +254,25 @@ class QueryParser
             $i++;
         }
 
-        return ['type' => 'SELECT', 'table' => $table, 'cols' => $cols, 'criteria' => $criteria, 'sort' => $sort, 'limit' => $limit, 'offset' => $offset];
+        return ['type' => 'SELECT', 'table' => $table, 'cols' => $cols, 'joins' => $joins, 'criteria' => $criteria, 'sort' => $sort, 'limit' => $limit, 'offset' => $offset];
     }
 
     private function parseWhere($tokens, $startIndex)
     {
-        $conditions = [];
+        $simpleConditions = [];
         $i = $startIndex;
-        $currentLogic = 'AND';
 
         while ($i < count($tokens)) {
             $token = $tokens[$i];
             $upper = strtoupper($token);
 
             if ($upper === 'AND' || $upper === 'OR') {
-                $currentLogic = $upper;
+                $simpleConditions[] = ['type' => 'logic', 'op' => $upper];
                 $i++;
                 continue;
             }
 
-            if (in_array($upper, ['ORDER', 'LIMIT', 'OFFSET', 'GROUP', 'KELOMPOK'])) {
+            if (in_array($upper, ['ORDER', 'LIMIT', 'OFFSET', 'GROUP', 'KELOMPOK', ')', ';'])) {
                 break;
             }
 
@@ -271,17 +293,45 @@ class QueryParser
                      if ((str_starts_with($v2, "'") || str_starts_with($v2, '"'))) $v2 = substr($v2, 1, -1);
                      elseif (is_numeric($v2)) $v2 = $v2 + 0;
 
-                     $conditions[] = ['key' => $key, 'op' => 'BETWEEN', 'val' => [$v1, $v2], 'logic' => $currentLogic];
+                     $simpleConditions[] = ['type' => 'cond', 'key' => $key, 'op' => 'BETWEEN', 'val' => [$v1, $v2]];
                      $consumed = 5;
+                     if (strtoupper($tokens[$i+3]) !== 'AND') throw new Exception("Syntax: BETWEEN v1 AND v2");
+
                 } elseif ($op === 'IS') {
                     $next = strtoupper($tokens[$i+2]);
                     if ($next === 'NULL') {
-                        $conditions[] = ['key' => $key, 'op' => 'IS NULL', 'val' => null, 'logic' => $currentLogic];
+                        $simpleConditions[] = ['type' => 'cond', 'key' => $key, 'op' => 'IS NULL', 'val' => null];
                         $consumed = 3;
                     } elseif ($next === 'NOT') {
-                        $conditions[] = ['key' => $key, 'op' => 'IS NOT NULL', 'val' => null, 'logic' => $currentLogic];
-                        $consumed = 4;
+                        if (strtoupper($tokens[$i+3]) === 'NULL') {
+                            $simpleConditions[] = ['type' => 'cond', 'key' => $key, 'op' => 'IS NOT NULL', 'val' => null];
+                            $consumed = 4;
+                        } else throw new Exception("Syntax: IS NOT NULL");
+                    } else throw new Exception("Syntax: IS NULL or IS NOT NULL");
+
+                } elseif ($op === 'IN' || $op === 'NOT') {
+                    if ($op === 'NOT') {
+                        if (strtoupper($tokens[$i+2]) !== 'IN') break; // or error
+                        $consumed++;
                     }
+                    $p = ($op === 'NOT') ? $i + 3 : $i + 2;
+                    $values = [];
+                    if ($tokens[$p] === '(') {
+                        $p++;
+                        while ($tokens[$p] !== ')') {
+                            if ($tokens[$p] !== ',') {
+                                $v = $tokens[$p];
+                                if (str_starts_with($v, "'") || str_starts_with($v, '"')) $v = substr($v, 1, -1);
+                                elseif (is_numeric($v)) $v = $v + 0;
+                                $values[] = $v;
+                            }
+                            $p++;
+                        }
+                        $val = $values;
+                        $consumed = ($p - $i) + 1;
+                    }
+                    $finalOp = ($op === 'NOT') ? 'NOT IN' : 'IN';
+                    $simpleConditions[] = ['type' => 'cond', 'key' => $key, 'op' => $finalOp, 'val' => $val];
                 } else {
                     $val = $tokens[$i + 2];
                     if (str_starts_with($val, "'") || str_starts_with($val, '"')) {
@@ -289,7 +339,7 @@ class QueryParser
                     } else if (is_numeric($val)) {
                         $val = $val + 0;
                     }
-                    $conditions[] = ['key' => $key, 'op' => $op, 'val' => $val, 'logic' => $currentLogic];
+                    $simpleConditions[] = ['type' => 'cond', 'key' => $key, 'op' => $op, 'val' => $val];
                     $consumed = 3;
                 }
                 $i += $consumed;
@@ -298,8 +348,40 @@ class QueryParser
             }
         }
 
-        if (count($conditions) === 1) return $conditions[0];
-        return ['type' => 'compound', 'conditions' => $conditions];
+        // Build Tree with Precedence: AND > OR
+        if (empty($simpleConditions)) return null;
+
+        // Pass 1: Combine ANDs
+        $pass1 = [];
+        $current = $simpleConditions[0];
+
+        for ($k = 1; $k < count($simpleConditions); $k += 2) {
+            $logic = $simpleConditions[$k]; // { type: 'logic', op: 'AND' }
+            $nextCond = $simpleConditions[$k + 1];
+
+            if ($logic['op'] === 'AND') {
+                if (isset($current['type']) && $current['type'] === 'compound' && $current['logic'] === 'AND') {
+                    $current['conditions'][] = $nextCond;
+                } else {
+                    $current = ['type' => 'compound', 'logic' => 'AND', 'conditions' => [$current, $nextCond]];
+                }
+            } else {
+                $pass1[] = $current;
+                $pass1[] = $logic;
+                $current = $nextCond;
+            }
+        }
+        $pass1[] = $current;
+
+        // Pass 2: Combine ORs
+        if (count($pass1) === 1) return $pass1[0];
+
+        $finalConditions = [];
+        for ($k = 0; $k < count($pass1); $k += 2) {
+            $finalConditions[] = $pass1[$k];
+        }
+
+        return ['type' => 'compound', 'logic' => 'OR', 'conditions' => $finalConditions];
     }
 
     private function parseDelete($tokens)
@@ -367,6 +449,18 @@ class QueryParser
     private function parseCreateIndex($tokens)
     {
         if (strtoupper($tokens[0]) === 'CREATE') {
+            // Check for syntax: CREATE INDEX table ON field
+            if (isset($tokens[2]) && isset($tokens[3]) && strtoupper($tokens[3]) === 'ON') {
+                 $table = $tokens[2];
+                 $field = $tokens[4];
+                 // Check if parens are used
+                 if ($field === '(' && isset($tokens[5])) {
+                     $field = $tokens[5];
+                 }
+                 return ['type' => 'CREATE_INDEX', 'table' => $table, 'field' => $field];
+            }
+
+            // Fallback or Strict SQL: CREATE INDEX ... ON table (field)
             $i = 2;
             if (strtoupper($tokens[$i]) !== 'ON' && isset($tokens[$i+1]) && strtoupper($tokens[$i+1]) === 'ON') {
                 $i++;
@@ -375,12 +469,16 @@ class QueryParser
             $i++;
             $table = $tokens[$i];
             $i++;
-            if ($tokens[$i] !== '(') throw new Exception("Syntax: ... ( [field] )");
-            $i++;
-            $field = $tokens[$i];
-            $i++;
-            if ($tokens[$i] !== ')') throw new Exception("Unclosed paren");
-            return ['type' => 'CREATE_INDEX', 'table' => $table, 'field' => $field];
+            if (isset($tokens[$i]) && $tokens[$i] === '(') {
+                 $i++;
+                 $field = $tokens[$i];
+                 $i++;
+                 if (isset($tokens[$i]) && $tokens[$i] !== ')') throw new Exception("Unclosed paren");
+                 return ['type' => 'CREATE_INDEX', 'table' => $table, 'field' => $field];
+            }
+             // Assume simple: ON table field
+             $field = $tokens[$i];
+             return ['type' => 'CREATE_INDEX', 'table' => $table, 'field' => $field];
         }
 
         if (count($tokens) < 4) throw new Exception("Syntax: INDEKS [table] PADA [field]");
@@ -445,6 +543,12 @@ class QueryParser
         if (isset($command['data'])) {
             foreach ($command['data'] as $k => $v) {
                 $command['data'][$k] = $bindValue($v);
+            }
+        }
+        
+        if (isset($command['updates'])) {
+            foreach ($command['updates'] as $k => $v) {
+                $command['updates'][$k] = $bindValue($v);
             }
         }
     }

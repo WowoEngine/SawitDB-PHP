@@ -27,20 +27,20 @@ Please support our brothers and sisters in Aceh.
 ## Features
 
 - **Paged Architecture**: Data is stored in 4096-byte binary pages.
-- **Single File Storage**: All data, schema, and indexes are stored in a single `.sawit` file.
-- **High Stability**: Uses 4KB atomic pages.
-- **Data Integrity**: Uses `flock` and standard PHP stream locking.
-- **Zero Bureaucracy**: Built with **standard PHP**. No massive vendor dependencies (only standard composer autoload).
-- **Speed**: Optimized for PHP Opcache.
-- **Network Support (NEW)**: Client-Server architecture using PHP Streams.
+- **Object Caching (New)**: Implements Page-Level Object Caching for high-speed reads (bypassing JSON parse for hot pages).
+- **Hash Joins (New)**: Optimized `JOIN` operations (O(M+N)) for massive performance gains on relations.
+- **Persistent Indexes (New)**: Indexes are now automatically persisted in `_indexes` system table and restored on load.
+- **Query Cache (New)**: LRU Cache for parsed queries to reduce CPU overhead.
+- **Zero Bureaucracy**: Built with **standard PHP**. No massive vendor dependencies.
+- **Network Support**: Client-Server architecture using PHP Streams.
 
 ## Philosophy
 
 ### Filosofi (ID)
-SawitDB dibangun dengan semangat "Kemandirian Data". Kami percaya database yang handal tidak butuh **Infrastruktur Langit** yang harganya triliunan tapi sering *down*. Berbeda dengan proyek negara yang mahal di *budget* tapi murah di kualitas, SawitDB menggunakan arsitektur **Single File** (`.sawit`) yang hemat biaya. Backup cukup *copy-paste*, tidak perlu sewa vendor konsultan asing. Fitur **`fsync`** kami menjamin data tertulis di *disk*, karena bagi kami, integritas data adalah harga mati, bukan sekadar bahan konferensi pers untuk minta maaf.
+SawitDB dibangun dengan semangat "Kemandirian Data". Kami percaya database yang handal tidak butuh **Infrastruktur Langit** yang harganya triliunan tapi sering *down*. Berbeda dengan proyek negara yang mahal di *budget* tapi murah di kualitas, SawitDB menggunakan arsitektur **Single File** (`.sawit`) yang hemat biaya. Backup cukup *copy-paste*, tidak perlu sewa vendor konsultan asing. Fitur **`fsync`** kami menjamin data tertulis di *disk*, karena bagi kami, integritas data adalah harga mati.
 
 ### Philosophy (EN)
-SawitDB is built with the spirit of "Data Sovereignty". We believe a reliable database doesn't need **"Sky Infrastructure"** that costs trillions yet goes *down* often. Unlike state projects that are expensive in budget but cheap in quality, SawitDB uses a cost-effective **Single File** (`.sawit`) architecture. Backup is just *copy-paste*, no need to hire expensive foreign consultants. Our **`fsync`** feature guarantees data is written to *disk*, because for us, data integrity is non-negotiable, not just material for a press conference to apologize.
+SawitDB is built with the spirit of "Data Sovereignty". We believe a reliable database doesn't need **"Sky Infrastructure"** that costs trillions yet goes *down* often. Unlike state projects that are expensive in budget but cheap in quality, SawitDB uses a cost-effective **Single File** (`.sawit`) architecture. Backup is just *copy-paste*.
 
 ## Installation
 
@@ -112,14 +112,16 @@ use SawitDB\Engine\WowoEngine;
 
 $db = new WowoEngine(__DIR__ . '/plantation.sawit');
 
-// Create Table
-$db->query("LAHAN trees");
+// Generic SQL
+$db->query("CREATE TABLE users");
+$db->query("INSERT INTO users (id, name) VALUES (1, 'Budi')");
 
-// Insert (Plant)
+// AQL
+$db->query("LAHAN trees");
 $db->query("TANAM KE trees (id, type) BIBIT (1, 'Dura')");
 
-// Select (Harvest)
-$rows = $db->query("PANEN * DARI trees WHRE type='Dura'");
+// Join
+$rows = $db->query("SELECT * FROM trees JOIN users ON trees.id = users.id");
 print_r($rows);
 ```
 
@@ -129,18 +131,6 @@ print_r($rows);
 - **Page 0 (Master Page)**: Contains header and Table Directory.
 - **Data & Indexes**: Stored in 4KB atomic pages.
 - **WowoEngine**: Core engine orchestrating Pager, Index, and Query Parser.
-
-## Benchmark Performance
-Test Environment: PHP 8.0+, Single Thread, Windows (Local NVMe)
-
-| Operation | Ops/Sec | Latency (avg) |
-|-----------|---------|---------------|
-| **INSERT** | ~22,780 | 0.044 ms |
-| **SELECT (PK Index)** | ~55,555 | 0.018 ms |
-| **UPDATE** | ~6,332 | 0.158 ms |
-| **DELETE** | ~3,477 | 0.288 ms |
-
-*Note: Results obtained on local development environment. High IOPS due to OS Page Cache & buffering.*
 
 ## Full Feature Comparison
 
@@ -155,19 +145,18 @@ Test Environment: PHP 8.0+, Single Thread, Windows (Local NVMe)
 | **Drop Table** | `BAKAR LAHAN [table]` | `DROP TABLE [table]` | Deletes table & data |
 | **Insert** | `TANAM KE [table] ... BIBIT (...)` | `INSERT INTO [table] (...) VALUES (...)` | Auto-ID if omitted |
 | **Select** | `PANEN ... DARI [table] DIMANA ...` | `SELECT ... FROM [table] WHERE ...` | Supports Projection |
+| **Join** | `... GABUNG [tbl] PADA ...` | `... JOIN [tbl] ON ...` | Hash/Nested Loop |
 | **Update** | `PUPUK [table] DENGAN ... DIMANA ...` | `UPDATE [table] SET ... WHERE ...` | Atomic update |
 | **Delete** | `GUSUR DARI [table] DIMANA ...` | `DELETE FROM [table] WHERE ...` | Row-level deletion |
 | **Index** | `INDEKS [table] PADA [field]` | `CREATE INDEX ON [table] (field)` | B-Tree Indexing |
 | **Count** | `HITUNG COUNT(*) DARI [table]` | `SELECT COUNT(*) FROM [table]` (via HITUNG) | Aggregation |
-| **Sum** | `HITUNG SUM(col) DARI [table]` | `SELECT SUM(col) FROM [table]` (via HITUNG) | Aggregation |
-| **Average** | `HITUNG AVG(col) DARI [table]` | `SELECT AVG(col) FROM [table]` (via HITUNG) | Aggregation |
 
 ### Supported Operators Table
 
 | Operator | Syntax Example | Description |
 |----------|----------------|-------------|
 | **Comparison** | `=`, `!=`, `>`, `<`, `>=`, `<=` | Standard value comparison |
-| **Logical** | `AND`, `OR` | Combine multiple conditions |
+| **Logical** | `AND`, `OR` | Combine multiple conditions (AND > OR) |
 | **In List** | `IN ('coffee', 'tea')` | Matches any value in the list |
 | **Not In** | `NOT IN ('water')` | Matches values NOT in list |
 | **Pattern** | `LIKE 'Jwa%'` | Standard SQL wildcard matching |
@@ -177,14 +166,6 @@ Test Environment: PHP 8.0+, Single Thread, Windows (Local NVMe)
 | **Limit** | `LIMIT 10` | Restrict number of rows |
 | **Offset** | `OFFSET 5` | Skip first N rows (Pagination) |
 | **Order** | `ORDER BY price DESC` | Sort by field (ASC/DESC) |
-
-## Project Structure
-
-- `src/Engine/`: Core Database Engine components (`WowoEngine`, `Pager`, `BTreeIndex`).
-- `src/Network/`: Networking components (`SawitServer`, `SawitClient`).
-- `src/Laravel/`: Laravel Integration (`ServiceProvider`, `Facade`).
-- `bin/sawit-server.php`: Server Entry Point.
-- `cli/`: Interactive CLI tools (`local.php`, `remote.php`).
 
 ## License
 
