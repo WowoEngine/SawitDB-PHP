@@ -105,4 +105,72 @@ class WAL
             rewind($this->handle);
         }
     }
+
+    public function recover()
+    {
+        if (!$this->enabled || !file_exists($this->path)) {
+            return [];
+        }
+
+        $operations = [];
+        $handle = fopen($this->path, 'rb');
+        if (!$handle) return [];
+
+        $fsize = fstat($handle)['size'];
+        if ($fsize == 0) {
+            fclose($handle);
+            return [];
+        }
+
+        $offset = 0;
+        while ($offset < $fsize) {
+            // Read Header
+            // Magic (4) + Size (4) + LSN (8) + Op (1) + Table (32) + PageId (4) + BSize (4) + ASize (4)
+            // Total fixed header: 61 bytes
+            if ($size = $fsize - $offset < 61) break; // Incomplete header
+
+            fseek($handle, $offset);
+            $headerBuf = fread($handle, 61);
+            if (strlen($headerBuf) < 61) break;
+
+            $data = unpack('Vmagic/Vsize/Plsn/Copcode/a32table/VpageId/VbeforeSize/VafterSize', $headerBuf);
+            
+            if ($data['magic'] !== self::MAGIC) break;
+
+            $tableName = str_replace("\0", "", $data['table']);
+            
+            // Read Payload
+            $payloadSize = $data['beforeSize'] + $data['afterSize'];
+            
+             // Sanity check size
+            if ($data['size'] !== (61 + $payloadSize)) {
+                // Corrupt entry size mismatch
+                break;
+            }
+
+            $beforeImage = null;
+            $afterImage = null;
+
+            if ($data['beforeSize'] > 0) {
+                $beforeImage = fread($handle, $data['beforeSize']);
+            }
+            if ($data['afterSize'] > 0) {
+                $afterImage = fread($handle, $data['afterSize']);
+            }
+
+            $operations[] = [
+                'lsn' => $data['lsn'],
+                'opCode' => $data['opcode'],
+                'tableName' => $tableName,
+                'pageId' => $data['pageId'],
+                'beforeImage' => $beforeImage,
+                'afterImage' => $afterImage
+            ];
+
+            $offset += $data['size'];
+        }
+
+        fclose($handle);
+        return $operations;
+    }
 }

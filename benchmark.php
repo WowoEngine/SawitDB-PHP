@@ -4,7 +4,7 @@ require __DIR__ . '/vendor/autoload.php';
 
 use SawitDB\Engine\WowoEngine;
 
-$dbFile = __DIR__ . '/benchmark.sawit';
+$dbFile = __DIR__ . '/data/benchmark.sawit';
 if (file_exists($dbFile)) unlink($dbFile);
 
 $db = new WowoEngine($dbFile);

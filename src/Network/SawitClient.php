@@ -2,139 +2,135 @@
 
 namespace SawitDB\Network;
 
-use Exception;
-
 class SawitClient
 {
-    private $socket;
-    private $connected = false;
     private $host;
     private $port;
-    private $requestId = 0;
+    private $socket;
+    
+    // Parsed from connection string
+    private $dbName;
+    private $username;
+    private $password;
 
-
-
-    public $currentDatabase = null;
-    private $user;
-    private $pass;
-    private $db;
-
-    public function __construct(string $connStr)
+    public function __construct($connectionString = 'sawitdb://127.0.0.1:8765')
     {
-        $this->parseConnectionString($connStr);
+        $this->parseConnectionString($connectionString);
+        $this->connect();
     }
 
-    private function parseConnectionString($connStr)
+    private function parseConnectionString($connStr) 
     {
-        // sawitdb://user:pass@host:port/db
-        $parts = parse_url($connStr);
+        // Simple parser for sawitdb://[user:pass@]host:port/database
+        $parsed = parse_url($connStr);
         
-        $this->host = $parts['host'] ?? 'localhost';
-        $this->port = $parts['port'] ?? 7878;
-        $this->user = $parts['user'] ?? null;
-        $this->pass = $parts['pass'] ?? null;
-        $this->db   = isset($parts['path']) ? ltrim($parts['path'], '/') : null;
+        if (!isset($parsed['scheme']) || $parsed['scheme'] !== 'sawitdb') {
+            // Fallback for simple host if no scheme provided, or default
+             throw new \Exception("Invalid protocol. Must start with sawitdb://");
+        }
+
+        $this->host = $parsed['host'] ?? '127.0.0.1';
+        $this->port = $parsed['port'] ?? 8765;
+        $this->dbName = isset($parsed['path']) ? ltrim($parsed['path'], '/') : null;
+        $this->username = $parsed['user'] ?? null;
+        $this->password = $parsed['pass'] ?? null;
     }
 
-    public function connect()
+    // Ensure persistent connection logic or auto-reconnect
+    private function connect()
     {
-        $uri = "tcp://{$this->host}:{$this->port}";
-        $this->socket = stream_socket_client($uri, $errno, $errstr, 10);
-        
+        $this->socket = stream_socket_client("tcp://{$this->host}:{$this->port}", $errno, $errstr, 30);
         if (!$this->socket) {
-            throw new Exception("Connection failed: $errstr ($errno)");
+            throw new \Exception("Connect failed: $errstr ($errno)");
+        }
+        stream_set_timeout($this->socket, 30);
+        
+        // Auto-login and select DB if present in connection string
+        if ($this->username && $this->password) {
+            $this->login($this->username, $this->password);
         }
         
-        $this->connected = true;
-        
-        // Read Welcome
-        $welcome = $this->readResponse();
-        if ($welcome['type'] !== 'welcome') {
-            throw new Exception("Invalid handshake");
-        }
-        
-        // Auth
-        if ($this->user) {
-            $this->send([
-                'type' => 'auth', 
-                'payload' => ['username' => $this->user, 'password' => $this->pass]
-            ]);
-            $res = $this->readResponse();
-            if ($res['type'] === 'error') throw new Exception("Auth failed: " . $res['error']);
-        }
-        
-        // Select DB
-        if ($this->db) {
-            $this->use($this->db);
+        if ($this->dbName) {
+            $this->useDatabase($this->dbName);
         }
     }
 
-    public function use($db)
-    {
-        $this->send(['type' => 'use', 'payload' => ['database' => $db]]);
-        $res = $this->readResponse();
-        if ($res['type'] === 'error') throw new Exception($res['error']);
-        $this->currentDatabase = $db;
-        return $res;
-    }
-
-    public function query($sql, $params = [])
-    {
-        $this->send([
-            'type' => 'query',
-            'payload' => ['query' => $sql, 'params' => $params]
-        ]);
-        
-        $res = $this->readResponse();
-        
-        if ($res['type'] === 'query_result') {
-            return $res['result'];
-        } elseif ($res['type'] === 'error') {
-            throw new Exception($res['error']);
+    private function sendRequest($req) {
+        if (!$this->socket || feof($this->socket)) {
+            $this->connect();
         }
-        return $res;
+
+        $json = json_encode($req);
+        $len = strlen($json);
+
+        fwrite($this->socket, pack('N', $len));
+        fwrite($this->socket, $json);
+
+        // Read Response
+        $header = fread($this->socket, 4);
+        if ($header === false || strlen($header) < 4) {
+            // Server might have closed it
+            fclose($this->socket);
+            throw new \Exception("Connection lost or invalid header");
+        }
+
+        $respLen = unpack('N', $header)[1];
+        $respJson = "";
+        $received = 0;
+        
+        while ($received < $respLen) {
+            $chunk = fread($this->socket, $respLen - $received);
+            if ($chunk === false || $chunk === '') break;
+            $respJson .= $chunk;
+            $received += strlen($chunk);
+        }
+        
+        $response = json_decode($respJson, true);
+        if (!$response) throw new \Exception("Invalid JSON response");
+
+        if ($response['status'] === 'error') {
+            throw new \Exception("Server Error: " . ($response['message'] ?? 'Unknown'));
+        }
+
+        return $response;
     }
 
-    public function listDatabases()
-    {
-        $this->send(['type' => 'list_databases']);
-        $res = $this->readResponse();
-        if ($res['type'] === 'database_list') return $res['databases'];
-        throw new Exception($res['error'] ?? 'Unknown error');
+    public function login($username, $password) {
+        $req = [
+            'command' => 'login',
+            'username' => $username,
+            'password' => $password
+        ];
+        return $this->sendRequest($req);
     }
 
-    public function ping()
+    public function useDatabase($dbName) {
+        $req = [
+            'command' => 'use',
+            'db' => $dbName
+        ];
+        return $this->sendRequest($req);
+    }
+
+    public function query(string $sql, array $params = [])
     {
-        $start = microtime(true);
-        $this->send(['type' => 'ping']);
-        $res = $this->readResponse();
-        $lat = (microtime(true) - $start) * 1000;
-        return ['latency' => $lat, 'server_time' => $res['timestamp'] ?? 0];
+        $req = [
+            'command' => 'query',
+            'sql' => $sql,
+            'params' => $params
+        ];
+        $res = $this->sendRequest($req);
+        return $res['data']; 
     }
     
-    public function stats()
-    {
-        $this->send(['type' => 'stats']);
-        $res = $this->readResponse();
-        if ($res['type'] === 'stats') return $res['stats'];
-        throw new Exception($res['error'] ?? 'Unknown error');
-    }
-
-    private function send($req)
-    {
-        fwrite($this->socket, json_encode($req) . "\n");
-    }
-
-    private function readResponse()
-    {
-        $line = fgets($this->socket);
-        if ($line === false) throw new Exception("Server disconnected");
-        return json_decode($line, true);
+    public function close() {
+        if ($this->socket) {
+            fclose($this->socket);
+            $this->socket = null;
+        }
     }
     
-    public function disconnect()
-    {
-        if ($this->socket) fclose($this->socket);
-        $this->connected = false;
+    public function __destruct() {
+        $this->close();
     }
 }

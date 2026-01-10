@@ -181,6 +181,14 @@ class QueryParser
     private function parseSelect($tokens)
     {
         $i = 1;
+        $distinct = false;
+        
+        // DISTINCT Check
+        if (isset($tokens[$i]) && in_array(strtoupper($tokens[$i]), ['DISTINCT', 'UNIK'])) {
+            $distinct = true;
+            $i++;
+        }
+
         $cols = [];
         while ($i < count($tokens) && !in_array(strtoupper($tokens[$i]), ['DARI', 'FROM'])) {
             if ($tokens[$i] !== ',') $cols[] = $tokens[$i];
@@ -195,24 +203,59 @@ class QueryParser
 
         // Parse Joins
         $joins = [];
-        while ($i < count($tokens) && in_array(strtoupper($tokens[$i]), ['JOIN', 'GABUNG'])) {
-            $i++; // Skip JOIN
+        while ($i < count($tokens)) {
+            $token = strtoupper($tokens[$i]);
+            $isJoin = false;
+            $joinType = 'INNER';
+            
+            if (in_array($token, ['JOIN', 'GABUNG'])) {
+                $isJoin = true;
+                $i++;
+            } elseif (in_array($token, ['LEFT', 'RIGHT', 'FULL', 'CROSS'])) {
+                $joinType = $token;
+                $i++;
+                if (strtoupper($tokens[$i]) === 'OUTER') $i++; // Skip OUTER
+                if ($i < count($tokens) && in_array(strtoupper($tokens[$i]), ['JOIN', 'GABUNG'])) {
+                    $isJoin = true;
+                    $i++;
+                } else {
+                     // Syntax error or maybe fallback?
+                     throw new Exception("Expected JOIN after $token");
+                }
+            } elseif ($token === 'GABUNG' && isset($tokens[$i+1])) {
+                 // AQL variants: GABUNG KIRI, GABUNG KANAN, GABUNG SILANG
+                 $next = strtoupper($tokens[$i+1]);
+                 if ($next === 'KIRI') { $joinType = 'LEFT'; $i += 2; $isJoin = true; }
+                 elseif ($next === 'KANAN') { $joinType = 'RIGHT'; $i += 2; $isJoin = true; }
+                 elseif ($next === 'SILANG') { $joinType = 'CROSS'; $i += 2; $isJoin = true; }
+                 else {
+                     $isJoin = true; // Just GABUNG (Inner)
+                     $i++; 
+                 }
+            }
+
+            if (!$isJoin) break;
+
             $joinTable = $tokens[$i];
             $i++;
 
-            if ($i >= count($tokens) || !in_array(strtoupper($tokens[$i]), ['ON', 'PADA'])) {
-                throw new Exception("Syntax: JOIN [table] ON [condition]");
+            $on = null;
+            if ($joinType !== 'CROSS') {
+                if ($i >= count($tokens) || !in_array(strtoupper($tokens[$i]), ['ON', 'PADA'])) {
+                    throw new Exception("Syntax: JOIN [table] ON [condition]");
+                }
+                $i++; // Skip ON
+
+                $left = $tokens[$i];
+                $i++;
+                $op = $tokens[$i];
+                $i++;
+                $right = $tokens[$i];
+                $i++;
+                $on = ['left' => $left, 'op' => $op, 'right' => $right];
             }
-            $i++; // Skip ON
 
-            $left = $tokens[$i];
-            $i++;
-            $op = $tokens[$i];
-            $i++;
-            $right = $tokens[$i];
-            $i++;
-
-            $joins[] = ['table' => $joinTable, 'on' => ['left' => $left, 'op' => $op, 'right' => $right]];
+            $joins[] = ['type' => $joinType, 'table' => $joinTable, 'on' => $on];
         }
 
         $criteria = null;
@@ -220,21 +263,66 @@ class QueryParser
             $i++;
             $criteria = $this->parseWhere($tokens, $i);
             // Move i past WHERE clause
-             while ($i < count($tokens) && !in_array(strtoupper($tokens[$i]), ['ORDER', 'LIMIT', 'OFFSET'])) {
+             while ($i < count($tokens) && !in_array(strtoupper($tokens[$i]), ['ORDER', 'LIMIT', 'OFFSET', 'GROUP', 'KELOMPOK'])) {
                 $i++;
             }
         }
+        
+        $groupBy = null;
+        $having = null;
+        
+        if ($i < count($tokens) && in_array(strtoupper($tokens[$i]), ['GROUP', 'KELOMPOK'])) {
+             // Handle GROUP BY / KELOMPOK
+             if (strtoupper($tokens[$i]) === 'GROUP') {
+                 $i++;
+                 if (strtoupper($tokens[$i]) === 'BY') $i++;
+             } else {
+                 $i++; // KELOMPOK
+             }
+             $groupBy = $tokens[$i];
+             $i++;
+             
+             // HAVING / DENGAN SYARAT
+             if ($i < count($tokens)) {
+                 $tok = strtoupper($tokens[$i]);
+                 if ($tok === 'HAVING') {
+                     $i++;
+                     $having = $this->parseWhere($tokens, $i);
+                     // Skip having clause
+                     while ($i < count($tokens) && !in_array(strtoupper($tokens[$i]), ['ORDER', 'LIMIT', 'OFFSET'])) {
+                        $i++;
+                    }
+                 } elseif ($tok === 'DENGAN') {
+                      if (isset($tokens[$i+1]) && strtoupper($tokens[$i+1]) === 'SYARAT') {
+                          $i += 2;
+                          $having = $this->parseWhere($tokens, $i);
+                          while ($i < count($tokens) && !in_array(strtoupper($tokens[$i]), ['ORDER', 'LIMIT', 'OFFSET'])) {
+                            $i++;
+                        }
+                      }
+                 }
+             }
+        }
 
         $sort = null;
-        if ($i < count($tokens) && strtoupper($tokens[$i]) === 'ORDER') {
+        if ($i < count($tokens) && in_array(strtoupper($tokens[$i]), ['ORDER', 'URUTKAN'])) {
             $i++;
-            if (strtoupper($tokens[$i]) === 'BY') $i++;
+            // URUTKAN BERDASARKAN
+            if (strtoupper($tokens[$i-1]) === 'URUTKAN' && isset($tokens[$i]) && strtoupper($tokens[$i]) === 'BERDASARKAN') {
+                $i++;
+            } elseif (strtoupper($tokens[$i]) === 'BY') {
+                $i++;
+            }
+            
             $key = $tokens[$i];
             $i++;
             $dir = 'asc';
-            if ($i < count($tokens) && in_array(strtoupper($tokens[$i]), ['ASC', 'DESC'])) {
-                $dir = strtolower($tokens[$i]);
-                $i++;
+            if ($i < count($tokens)) {
+                $d = strtoupper($tokens[$i]);
+                if (in_array($d, ['ASC', 'DESC', 'NAIK', 'TURUN'])) {
+                   $dir = ($d === 'DESC' || $d === 'TURUN') ? 'desc' : 'asc';
+                   $i++;
+                }
             }
             $sort = ['key' => $key, 'dir' => $dir];
         }
@@ -242,19 +330,35 @@ class QueryParser
         $limit = null;
         $offset = null;
 
-        if ($i < count($tokens) && strtoupper($tokens[$i]) === 'LIMIT') {
-            $i++;
-            $limit = (int)$tokens[$i];
-            $i++;
+        while($i < count($tokens)) {
+            $tok = strtoupper($tokens[$i]);
+            if ($tok === 'LIMIT' || $tok === 'HANYA') {
+                $i++;
+                $limit = (int)$tokens[$i];
+                $i++;
+            } elseif ($tok === 'OFFSET' || ($tok === 'MULAI' && isset($tokens[$i+1]) && strtoupper($tokens[$i+1]) === 'DARI')) {
+                if ($tok === 'MULAI') $i++; // Skip MULAI. DARI is next
+                $i++; 
+                $offset = (int)$tokens[$i];
+                $i++;
+            } else {
+                break;
+            }
         }
 
-        if ($i < count($tokens) && strtoupper($tokens[$i]) === 'OFFSET') {
-            $i++;
-            $offset = (int)$tokens[$i];
-            $i++;
-        }
-
-        return ['type' => 'SELECT', 'table' => $table, 'cols' => $cols, 'joins' => $joins, 'criteria' => $criteria, 'sort' => $sort, 'limit' => $limit, 'offset' => $offset];
+        return [
+            'type' => 'SELECT', 
+            'table' => $table, 
+            'cols' => $cols, 
+            'joins' => $joins, 
+            'criteria' => $criteria, 
+            'sort' => $sort, 
+            'limit' => $limit, 
+            'offset' => $offset,
+            'distinct' => $distinct,
+            'groupBy' => $groupBy,
+            'having' => $having
+        ];
     }
 
     private function parseWhere($tokens, $startIndex)
